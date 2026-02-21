@@ -19,6 +19,7 @@ let currentCidadaoIdForDetails = null;
 let currentEditingDemandaId = null;
 let viewingDemandaId = null;
 let appInitialized = false;
+let _initLock = false; // mutex: impede dupla inicialização
 let logoBtn, logoutBtn, sidebarNav, addCidadaoBtn, addDemandaGeralBtn,
     closeModalBtn, cancelBtn, saveBtn, closeDetailsModalBtn, closeDemandaModalBtn,
     cancelDemandaBtn, closeDemandaDetailsBtn, closeMapBtn, cidadaoModal,
@@ -45,22 +46,25 @@ document.addEventListener('DOMContentLoaded', () => {
     const loginBtn = document.getElementById('login-btn');
     const emailInput = document.getElementById('email-address');
     const passwordInput = document.getElementById('password');
-    sb.auth.onAuthStateChange(async (event, session) => {
+    sb.auth.onAuthStateChange((event, session) => {
         if (session && session.user) {
             user = session.user;
             loginPage.classList.add('hidden');
             appContainer.style.display = 'flex';
-            if (!appInitialized) {
-                 await initializeMainApp(); 
+            if (!appInitialized && !_initLock) {
+                _initLock = true;
+                initializeMainApp().finally(() => { _initLock = false; });
             }
-        } else if (event === 'SIGNED_OUT') {
+        } else if (event === 'SIGNED_OUT' || (event === 'INITIAL_SESSION' && !session)) {
             user = null;
+            userRole = null;
+            allCidadaos = []; allDemandas = []; allLeaders = [];
+            appInitialized = false;
+            _initLock = false;
+            const lb = document.getElementById('logout-btn');
+            if (lb) { lb.disabled = false; lb.innerHTML = 'Sair'; }
             loginPage.classList.remove('hidden');
             appContainer.style.display = 'none';
-            appInitialized = false;
-        } else if (event === 'INITIAL_SESSION' && !session) {
-            user = null;
-            appInitialized = false;
         }
     });
     loginForm.addEventListener('submit', async (e) => {
@@ -85,11 +89,15 @@ document.addEventListener('DOMContentLoaded', () => {
     });
     async function manageSessionOnLoad() {
         const { data: { session } } = await sb.auth.getSession();
-        if (session) {
+        if (session && session.user) {
             user = session.user;
             loginPage.classList.add('hidden');
             appContainer.style.display = 'flex';
-            await initializeMainApp(); 
+            if (!appInitialized && !_initLock) {
+                _initLock = true;
+                try { await initializeMainApp(); }
+                finally { _initLock = false; }
+            }
         } else {
             user = null;
             loginPage.classList.remove('hidden');
@@ -99,6 +107,8 @@ document.addEventListener('DOMContentLoaded', () => {
     manageSessionOnLoad();
     async function initializeMainApp() {
         if (appInitialized) return;
+        allCidadaos = []; allDemandas = []; allLeaders = [];
+        userRole = null;
         await new Promise(resolve => setTimeout(resolve, 50)); 
         logoBtn = document.getElementById('logo-btn'); 
         logoutBtn = document.getElementById('logout-btn');
@@ -186,14 +196,11 @@ document.addEventListener('DOMContentLoaded', () => {
         logoutBtn.addEventListener('click', async () => {
             try {
                 logoutBtn.disabled = true;
+                logoutBtn.innerHTML = '<div class="spinner mx-auto"></div>';
                 await sb.auth.signOut();
-                appInitialized = false;
-                // Reseta estado global
-                allCidadaos = []; allDemandas = []; allLeaders = [];
-                totalCidadaosCount = 0; cidadaosServerOffset = 0;
-                userRole = null;
             } catch (error) {
                 logoutBtn.disabled = false;
+                logoutBtn.innerHTML = 'Sair';
                 showToast("Erro ao terminar sessão.", "error");
             }
         });
@@ -241,6 +248,7 @@ document.addEventListener('DOMContentLoaded', () => {
         generateReportBtn.addEventListener('click', generatePrintReport);
         const excelReportBtn = document.getElementById('generate-excel-btn');
         if (excelReportBtn) excelReportBtn.addEventListener('click', generateExcelReport);
+
         cancelDeleteBtn.addEventListener('click', closeConfirmationModal);
         confirmDeleteBtn.addEventListener('click', handleDeleteConfirmation);
         cidadaoCEP.addEventListener('blur', handleCEPBlur);
@@ -273,7 +281,7 @@ document.addEventListener('DOMContentLoaded', () => {
     async function loadInitialData() {
         if (!user) return;
         try {
-            // ── Busca o perfil do utilizador (admin ou cadastrador) ──────
+            // ── 1. Perfil primeiro — define userRole antes de tudo ───────
             const { data: profileData, error: profileError } = await sb
                 .from('profiles')
                 .select('role')
@@ -287,35 +295,33 @@ document.addEventListener('DOMContentLoaded', () => {
             userRole = profileData.role;
             applyRoleUI();
 
-            // Carrega apenas lideranças para popular selects
-            const { data: leadersData, error: leadersError } = await sb
-                .from('cidadaos')
-                .select('id, name, type')
-                .eq('type', 'Liderança')
-                .order('name', { ascending: true });
-            if (leadersError) throw leadersError;
-            allLeaders = leadersData;
-
-            // Carrega demandas com JOIN no cidadao para trazer nome e leader
-            // Isso evita depender de allCidadaos (que só tem a página atual)
-            const { data: demandasData, error: demandasError } = await sb
-                .from('demandas')
-                .select('*, cidadao:cidadaos(id, name, leader)')
-                .order('created_at', { ascending: false });
-            if (demandasError) throw demandasError;
-            allDemandas = demandasData;
-
-            // Carrega bairros distintos para o filtro
-            await loadBairrosDistintos();
+            // ── 2. Líderes + demandas + bairros em paralelo ──────────────
+            const [leadersRes, demandasRes] = await Promise.all([
+                sb.from('cidadaos')
+                    .select('id, name, type')
+                    .eq('type', 'Liderança')
+                    .order('name', { ascending: true }),
+                sb.from('demandas')
+                    .select('*, cidadao:cidadaos(id, name, leader)')
+                    .order('created_at', { ascending: false }),
+                loadBairrosDistintos()
+            ]);
+            if (leadersRes.error) throw leadersRes.error;
+            if (demandasRes.error) throw demandasRes.error;
+            allLeaders = leadersRes.data;
+            allDemandas = demandasRes.data;
 
             updateLeaderSelects();
             updateBairroFilter();
-
-            // Primeira página de cidadãos (server-side)
-            await loadCidadaosPage(true);
-
             renderAllDemandas();
-            await updateDashboard();
+
+            // ── 3. Cidadãos + dashboard + utilizadores em paralelo ───────
+            await Promise.all([
+                loadCidadaosPage(true),
+                updateDashboard(),
+                Promise.resolve()
+            ]);
+
             return true;
         } catch (error) {
             console.error(error);
@@ -333,7 +339,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 document.getElementById('view-map-btn'),        // mapa global
             ];
             els.forEach(el => { if (el) el.classList.add('hidden'); });
-            // Esconde link "Mapa" na sidebar
+            // Esconde link Mapa na sidebar para cadastrador
             document.querySelectorAll('#sidebar-nav a').forEach(a => {
                 if (a.getAttribute('href') === '#mapa') a.parentElement.classList.add('hidden');
             });
@@ -631,8 +637,7 @@ document.addEventListener('DOMContentLoaded', () => {
             notes.forEach(note => {
                 const noteEl = document.createElement('div');
                 noteEl.className = 'p-3 bg-gray-100 rounded-lg';
-                const escHtml = s => String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-                noteEl.innerHTML = `<p class="text-sm text-gray-800">${escHtml(note.text)}</p><p class="text-xs text-gray-500 text-right">${escHtml(note.author || 'Utilizador')} - ${new Date(note.created_at).toLocaleString('pt-BR')}</p>`;
+                noteEl.innerHTML = `<p class="text-sm text-gray-800">${note.text}</p><p class="text-xs text-gray-500 text-right">${note.author || 'Utilizador'} - ${new Date(note.created_at).toLocaleString('pt-BR')}</p>`;
                 notesListEl.appendChild(noteEl);
             });
             notesListEl.scrollTop = notesListEl.scrollHeight;
@@ -703,7 +708,7 @@ document.addEventListener('DOMContentLoaded', () => {
             closeConfirmationModal();
         }
     }
-    // getFilteredCidadaos removida — filtragem feita no servidor via loadCidadaosPage
+    // getFilteredCidadaos removida — filtragem feita no servidor
     // ── PERFORMANCE: card construído como elemento DOM (sem innerHTML com dados de usuário) ─
     function buildCidadaoCard(cidadao) {
         const card = document.createElement('div');
@@ -864,13 +869,16 @@ document.addEventListener('DOMContentLoaded', () => {
             totalEl.textContent = totalCidadaosCount;
         }
         document.getElementById('dashboard-total-demandas').textContent = allDemandas.length;
-        await updateAniversariantes();
+        // Gráficos e widgets em paralelo — não dependem uns dos outros
         updateDemandasRecentes();
         updateCidadaosPorTipoChart();
         updateDemandasPorStatusChart();
-        updateCidadaosPorBairroChart();
-        updateCidadaosPorSexoChart();
-        updateCidadaosPorFaixaEtariaChart();
+        await Promise.all([
+            updateAniversariantes(),
+            updateCidadaosPorBairroChart(),
+            updateCidadaosPorSexoChart(),
+            updateCidadaosPorFaixaEtariaChart()
+        ]);
     }
     async function updateAniversariantes() {
         const listEl = document.getElementById('aniversariantes-list');
@@ -1032,9 +1040,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const ctx = document.getElementById('cidadaos-por-sexo-chart');
         if (!ctx) return;
         try {
-            const { data, error } = await sb
-                .from('cidadaos')
-                .select('sexo');
+            const { data, error } = await sb.from('cidadaos').select('sexo');
             if (error) throw error;
             const contagem = (data || []).reduce((acc, c) => {
                 const sexo = c.sexo || 'Não Informar';
@@ -1055,15 +1061,10 @@ document.addEventListener('DOMContentLoaded', () => {
         const ctx = document.getElementById('cidadaos-por-faixa-etaria-chart');
         if (!ctx) return;
         try {
-            const { data, error } = await sb
-                .from('cidadaos')
-                .select('dob');
+            const { data, error } = await sb.from('cidadaos').select('dob');
             if (error) throw error;
             const faixas = { '0-17': 0, '18-25': 0, '26-35': 0, '36-50': 0, '51-65': 0, '66+': 0, 'N/A': 0 };
-            (data || []).forEach(c => {
-                const faixa = getFaixaEtaria(c.dob);
-                faixas[faixa]++;
-            });
+            (data || []).forEach(c => { const faixa = getFaixaEtaria(c.dob); faixas[faixa]++; });
             const labels = Object.keys(faixas);
             const values = Object.values(faixas);
             if (cidadaosFaixaEtariaChart) cidadaosFaixaEtariaChart.destroy();
@@ -1527,6 +1528,7 @@ function closeMapModal() {
         if (pageId === 'dashboard-page') {
             updateDashboard();
         }
+
     }
     function showToast(message, type = 'info') {
         const container = document.getElementById('toast-container');
